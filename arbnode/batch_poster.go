@@ -42,6 +42,7 @@ import (
 	"github.com/offchainlabs/nitro/cmd/chaininfo"
 	"github.com/offchainlabs/nitro/cmd/genericconf"
 	"github.com/offchainlabs/nitro/das"
+	celestiaTypes "github.com/offchainlabs/nitro/das/celestia/types"
 	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/solgen/go/bridgegen"
 	"github.com/offchainlabs/nitro/util"
@@ -89,6 +90,7 @@ type BatchPoster struct {
 	gasRefunderAddr    common.Address
 	building           *buildingBatch
 	daWriter           das.DataAvailabilityServiceWriter
+	celestiaWriter     celestiaTypes.DataAvailabilityWriter
 	dataPoster         *dataposter.DataPoster
 	redisLock          *redislock.Simple
 	messagesPerBatch   *arbmath.MovingAverage[uint64]
@@ -118,8 +120,11 @@ const (
 )
 
 type BatchPosterConfig struct {
-	Enable                             bool `koanf:"enable"`
-	DisableDasFallbackStoreDataOnChain bool `koanf:"disable-das-fallback-store-data-on-chain" reload:"hot"`
+	Enable bool `koanf:"enable"`
+	// TODO (Diego) rework the 3 configs below once unified writer interface is in
+	DisableDasFallbackStoreDataOnChain      bool `koanf:"disable-das-fallback-store-data-on-chain" reload:"hot"`
+	DisableCelestiaFallbackStoreDataOnChain bool `koanf:"disable-celestia-fallback-store-data-on-chain" reload:"hot"`
+	DisableCelestiaFallbackStoreDataOnDAS   bool `koanf:"disable-celestia-fallback-store-data-on-das" reload:"hot"`
 	// Max batch size.
 	MaxSize int `koanf:"max-size" reload:"hot"`
 	// Maximum 4844 blob enabled batch size.
@@ -259,17 +264,18 @@ var TestBatchPosterConfig = BatchPosterConfig{
 }
 
 type BatchPosterOpts struct {
-	DataPosterDB  ethdb.Database
-	L1Reader      *headerreader.HeaderReader
-	Inbox         *InboxTracker
-	Streamer      *TransactionStreamer
-	VersionGetter execution.FullExecutionClient
-	SyncMonitor   *SyncMonitor
-	Config        BatchPosterConfigFetcher
-	DeployInfo    *chaininfo.RollupAddresses
-	TransactOpts  *bind.TransactOpts
-	DAWriter      das.DataAvailabilityServiceWriter
-	ParentChainID *big.Int
+	DataPosterDB   ethdb.Database
+	L1Reader       *headerreader.HeaderReader
+	Inbox          *InboxTracker
+	Streamer       *TransactionStreamer
+	VersionGetter  execution.FullExecutionClient
+	SyncMonitor    *SyncMonitor
+	Config         BatchPosterConfigFetcher
+	DeployInfo     *chaininfo.RollupAddresses
+	TransactOpts   *bind.TransactOpts
+	DAWriter       das.DataAvailabilityServiceWriter
+	CelestiaWriter celestiaTypes.DataAvailabilityWriter
+	ParentChainID  *big.Int
 }
 
 func NewBatchPoster(ctx context.Context, opts *BatchPosterOpts) (*BatchPoster, error) {
@@ -315,6 +321,7 @@ func NewBatchPoster(ctx context.Context, opts *BatchPosterOpts) (*BatchPoster, e
 		gasRefunderAddr:    opts.Config().gasRefunder,
 		bridgeAddr:         opts.DeployInfo.Bridge,
 		daWriter:           opts.DAWriter,
+		celestiaWriter:     opts.CelestiaWriter,
 		redisLock:          redisLock,
 	}
 	b.messagesPerBatch, err = arbmath.NewMovingAverage[uint64](20)
@@ -1194,29 +1201,51 @@ func (b *BatchPoster) maybePostSequencerBatch(ctx context.Context) (bool, error)
 		return false, nil
 	}
 
-	if b.daWriter != nil {
-		if !b.redisLock.AttemptLock(ctx) {
-			return false, errAttemptLockFailed
-		}
-
-		gotNonce, gotMeta, err := b.dataPoster.GetNextNonceAndMeta(ctx)
+	if b.celestiaWriter != nil {
+		celestiaMsg, err := b.celestiaWriter.Store(ctx, sequencerMsg)
 		if err != nil {
-			return false, err
-		}
-		if nonce != gotNonce || !bytes.Equal(batchPositionBytes, gotMeta) {
-			return false, fmt.Errorf("%w: nonce changed from %d to %d while creating batch", storage.ErrStorageRace, nonce, gotNonce)
-		}
-
-		cert, err := b.daWriter.Store(ctx, sequencerMsg, uint64(time.Now().Add(config.DASRetentionPeriod).Unix()), []byte{}) // b.daWriter will append signature if enabled
-		if errors.Is(err, das.BatchToDasFailed) {
-			if config.DisableDasFallbackStoreDataOnChain {
-				return false, errors.New("unable to batch to DAS and fallback storing data on chain is disabled")
+			if config.DisableCelestiaFallbackStoreDataOnChain && config.DisableCelestiaFallbackStoreDataOnDAS {
+				return false, errors.New("unable to post batch to Celestia and fallback storing data on chain and das is disabled")
 			}
-			log.Warn("Falling back to storing data on chain", "err", err)
-		} else if err != nil {
-			return false, err
+			if config.DisableCelestiaFallbackStoreDataOnDAS {
+				log.Warn("Falling back to storing data on chain ", "err", err)
+			} else {
+				log.Warn("Falling back to storing data on DAC ", "err", err)
+
+			}
+
+			// We nest the anytrust logic here for now as using this fork liekly means your primary DA is Celestia
+			// and the Anytrust DAC is instead used as a fallback
+			if b.daWriter != nil {
+				if config.DisableCelestiaFallbackStoreDataOnDAS {
+					return false, errors.New("found Celestia DA enabled and DAS, but fallbacks to DAS are disabled")
+				}
+				if !b.redisLock.AttemptLock(ctx) {
+					return false, errAttemptLockFailed
+				}
+
+				gotNonce, gotMeta, err := b.dataPoster.GetNextNonceAndMeta(ctx)
+				if err != nil {
+					return false, err
+				}
+				if nonce != gotNonce || !bytes.Equal(batchPositionBytes, gotMeta) {
+					return false, fmt.Errorf("%w: nonce changed from %d to %d while creating batch", storage.ErrStorageRace, nonce, gotNonce)
+				}
+
+				cert, err := b.daWriter.Store(ctx, sequencerMsg, uint64(time.Now().Add(config.DASRetentionPeriod).Unix()), []byte{}) // b.daWriter will append signature if enabled
+				if errors.Is(err, das.BatchToDasFailed) {
+					if config.DisableDasFallbackStoreDataOnChain {
+						return false, errors.New("unable to batch to DAS and fallback storing data on chain is disabled")
+					}
+					log.Warn("Falling back to storing data on chain", "err", err)
+				} else if err != nil {
+					return false, err
+				} else {
+					sequencerMsg = das.Serialize(cert)
+				}
+			}
 		} else {
-			sequencerMsg = das.Serialize(cert)
+			sequencerMsg = celestiaMsg
 		}
 	}
 

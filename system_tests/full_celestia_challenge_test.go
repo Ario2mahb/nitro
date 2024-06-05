@@ -10,8 +10,12 @@ package arbtest
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"math/big"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 	"testing"
@@ -30,19 +34,31 @@ import (
 	"github.com/offchainlabs/nitro/arbnode"
 	"github.com/offchainlabs/nitro/arbos"
 	"github.com/offchainlabs/nitro/arbstate"
-	"github.com/offchainlabs/nitro/arbutil"
+	"github.com/offchainlabs/nitro/das/celestia"
+	celestiaTypes "github.com/offchainlabs/nitro/das/celestia/types"
 	"github.com/offchainlabs/nitro/execution/gethexec"
-	"github.com/offchainlabs/nitro/solgen/go/challengegen"
 	"github.com/offchainlabs/nitro/solgen/go/mocksgen"
 	"github.com/offchainlabs/nitro/solgen/go/ospgen"
-	"github.com/offchainlabs/nitro/solgen/go/yulgen"
+
 	"github.com/offchainlabs/nitro/staker"
 	"github.com/offchainlabs/nitro/validator"
 	"github.com/offchainlabs/nitro/validator/server_common"
 	"github.com/offchainlabs/nitro/validator/valnode"
 )
 
-func DeployOneStepProofEntry(t *testing.T, ctx context.Context, auth *bind.TransactOpts, client *ethclient.Client) common.Address {
+func init() {
+	go func() {
+		fmt.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+}
+
+// TODO:
+// Find a way to trigger the other two cases
+// add Fee stuff
+// Cleanup code
+// make release, preimage oracle, write up, send to Ottersec
+
+func DeployOneStepProofEntryCelestia(t *testing.T, ctx context.Context, auth *bind.TransactOpts, client *ethclient.Client) common.Address {
 	osp0, tx, _, err := ospgen.DeployOneStepProver0(auth, client)
 	Require(t, err)
 	_, err = EnsureTxSucceeded(ctx, client, tx)
@@ -71,68 +87,7 @@ func DeployOneStepProofEntry(t *testing.T, ctx context.Context, auth *bind.Trans
 	return ospEntry
 }
 
-func CreateChallenge(
-	t *testing.T,
-	ctx context.Context,
-	auth *bind.TransactOpts,
-	client *ethclient.Client,
-	ospEntry common.Address,
-	sequencerInbox common.Address,
-	delayedBridge common.Address,
-	wasmModuleRoot common.Hash,
-	startGlobalState validator.GoGlobalState,
-	endGlobalState validator.GoGlobalState,
-	numBlocks uint64,
-	asserter common.Address,
-	challenger common.Address,
-) (*mocksgen.MockResultReceiver, common.Address) {
-	challengeManagerLogic, tx, _, err := challengegen.DeployChallengeManager(auth, client)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, client, tx)
-	Require(t, err)
-	challengeManagerAddr, tx, _, err := mocksgen.DeploySimpleProxy(auth, client, challengeManagerLogic)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, client, tx)
-	Require(t, err)
-	challengeManager, err := challengegen.NewChallengeManager(challengeManagerAddr, client)
-	Require(t, err)
-
-	resultReceiverAddr, _, resultReceiver, err := mocksgen.DeployMockResultReceiver(auth, client, challengeManagerAddr)
-	Require(t, err)
-	tx, err = challengeManager.Initialize(auth, resultReceiverAddr, sequencerInbox, delayedBridge, ospEntry)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, client, tx)
-	Require(t, err)
-	tx, err = resultReceiver.CreateChallenge(
-		auth,
-		wasmModuleRoot,
-		[2]uint8{
-			staker.StatusFinished,
-			staker.StatusFinished,
-		},
-		[2]mocksgen.GlobalState{
-			{
-				Bytes32Vals: [2][32]byte{startGlobalState.BlockHash, startGlobalState.SendRoot},
-				U64Vals:     [2]uint64{startGlobalState.Batch, startGlobalState.PosInBatch},
-			},
-			{
-				Bytes32Vals: [2][32]byte{endGlobalState.BlockHash, endGlobalState.SendRoot},
-				U64Vals:     [2]uint64{endGlobalState.Batch, endGlobalState.PosInBatch},
-			},
-		},
-		numBlocks,
-		asserter,
-		challenger,
-		big.NewInt(100000),
-		big.NewInt(100000),
-	)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, client, tx)
-	Require(t, err)
-	return resultReceiver, challengeManagerAddr
-}
-
-func writeTxToBatch(writer io.Writer, tx *types.Transaction) error {
+func writeTxToCelestiaBatch(writer io.Writer, tx *types.Transaction) error {
 	txData, err := tx.MarshalBinary()
 	if err != nil {
 		return err
@@ -145,9 +100,7 @@ func writeTxToBatch(writer io.Writer, tx *types.Transaction) error {
 	return err
 }
 
-const makeBatch_MsgsPerBatch = int64(5)
-
-func makeBatch(t *testing.T, l2Node *arbnode.Node, l2Info *BlockchainTestInfo, backend *ethclient.Client, sequencer *bind.TransactOpts, seqInbox *mocksgen.SequencerInboxStub, seqInboxAddr common.Address, modStep int64) {
+func makeCelestiaBatch(t *testing.T, l2Node *arbnode.Node, celestiaDA *celestia.CelestiaDA, undecided bool, counterfactual bool, mockStream *mocksgen.Mockstream, deployer *bind.TransactOpts, l2Info *BlockchainTestInfo, backend *ethclient.Client, sequencer *bind.TransactOpts, seqInbox *mocksgen.SequencerInboxStub, seqInboxAddr common.Address, modStep int64) {
 	ctx := context.Background()
 
 	batchBuffer := bytes.NewBuffer([]byte{})
@@ -156,13 +109,41 @@ func makeBatch(t *testing.T, l2Node *arbnode.Node, l2Info *BlockchainTestInfo, b
 		if i == modStep {
 			value++
 		}
-		err := writeTxToBatch(batchBuffer, l2Info.PrepareTx("Owner", "Destination", 1000000, big.NewInt(value), []byte{}))
+		err := writeTxToCelestiaBatch(batchBuffer, l2Info.PrepareTx("Owner", "Destination", 1000000, big.NewInt(value), []byte{}))
 		Require(t, err)
 	}
 	compressed, err := arbcompress.CompressWell(batchBuffer.Bytes())
 	Require(t, err)
 	message := append([]byte{0}, compressed...)
+	message, err = celestiaDA.Store(ctx, message)
+	Require(t, err)
 
+	buf := bytes.NewBuffer(message)
+
+	header, err := buf.ReadByte()
+	Require(t, err)
+	if !celestia.IsCelestiaMessageHeaderByte(header) {
+		err := errors.New("tried to deserialize a message that doesn't have the Celestia header")
+		Require(t, err)
+	}
+
+	blobPointer := celestiaTypes.BlobPointer{}
+	blobBytes := buf.Bytes()
+	err = blobPointer.UnmarshalBinary(blobBytes)
+	Require(t, err)
+
+	dataCommitment, err := celestiaDA.Prover.Trpc.DataCommitment(ctx, blobPointer.BlockHeight-1, blobPointer.BlockHeight+1)
+	if err != nil {
+		t.Log("Error when fetching data commitment:", err)
+	}
+	Require(t, err)
+	mockStream.SubmitDataCommitment(deployer, [32]byte(dataCommitment.DataCommitment), blobPointer.BlockHeight-1, blobPointer.BlockHeight+1)
+	if counterfactual {
+		mockStream.UpdateGenesisState(deployer, (blobPointer.BlockHeight - 1100))
+	} else if undecided {
+		t.Log("Block Height before change: ", blobPointer.BlockHeight)
+		mockStream.UpdateGenesisState(deployer, (blobPointer.BlockHeight - 100))
+	}
 	seqNum := new(big.Int).Lsh(common.Big1, 256)
 	seqNum.Sub(seqNum, common.Big1)
 	tx, err := seqInbox.AddSequencerL2BatchFromOrigin8f111f3c(sequencer, seqNum, message, big.NewInt(1), common.Address{}, big.NewInt(0), big.NewInt(0))
@@ -183,63 +164,8 @@ func makeBatch(t *testing.T, l2Node *arbnode.Node, l2Info *BlockchainTestInfo, b
 	Require(t, err, "failed to get batch metadata after adding batch:")
 }
 
-func confirmLatestBlock(ctx context.Context, t *testing.T, l1Info *BlockchainTestInfo, backend arbutil.L1Interface) {
-	t.Helper()
-	// With SimulatedBeacon running in on-demand block production mode, the
-	// finalized block is considered to be be the nearest multiple of 32 less
-	// than or equal to the block number.
-	for i := 0; i < 32; i++ {
-		SendWaitTestTransactions(t, ctx, backend, []*types.Transaction{
-			l1Info.PrepareTx("Faucet", "Faucet", 30000, big.NewInt(1e12), nil),
-		})
-	}
-}
+func RunCelestiaChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, challengeMsgIdx int64, undecided bool, counterFactual bool) {
 
-func setupSequencerInboxStub(ctx context.Context, t *testing.T, l1Info *BlockchainTestInfo, l1Client arbutil.L1Interface, chainConfig *params.ChainConfig) (common.Address, *mocksgen.SequencerInboxStub, common.Address) {
-	txOpts := l1Info.GetDefaultTransactOpts("deployer", ctx)
-	bridgeAddr, tx, bridge, err := mocksgen.DeployBridgeUnproxied(&txOpts, l1Client)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	reader4844, tx, _, err := yulgen.DeployReader4844(&txOpts, l1Client)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	timeBounds := mocksgen.ISequencerInboxMaxTimeVariation{
-		DelayBlocks:   big.NewInt(10000),
-		FutureBlocks:  big.NewInt(10000),
-		DelaySeconds:  big.NewInt(10000),
-		FutureSeconds: big.NewInt(10000),
-	}
-	seqInboxAddr, tx, seqInbox, err := mocksgen.DeploySequencerInboxStub(
-		&txOpts,
-		l1Client,
-		bridgeAddr,
-		l1Info.GetAddress("sequencer"),
-		timeBounds,
-		big.NewInt(117964),
-		reader4844,
-		false,
-	)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	tx, err = bridge.SetSequencerInbox(&txOpts, seqInboxAddr)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	tx, err = bridge.SetDelayedInbox(&txOpts, seqInboxAddr, true)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	tx, err = seqInbox.AddInitMessage(&txOpts, chainConfig.ChainID)
-	Require(t, err)
-	_, err = EnsureTxSucceeded(ctx, l1Client, tx)
-	Require(t, err)
-	return bridgeAddr, seqInbox, seqInboxAddr
-}
-
-func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, challengeMsgIdx int64) {
 	glogger := log.NewGlogHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(false)))
 	glogger.Verbosity(log.LvlInfo)
 	log.Root().SetHandler(glogger)
@@ -260,6 +186,34 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 	conf.BlockValidator.Enable = false
 	conf.BatchPoster.Enable = false
 	conf.InboxReader.CheckDelay = time.Second
+	chainConfig.ArbitrumChainParams.CelestiaDA = true
+
+	deployerTxOpts := l1Info.GetDefaultTransactOpts("deployer", ctx)
+	blobstream, tx, mockStreamWrapper, err := mocksgen.DeployMockstream(&deployerTxOpts, l1Backend)
+	Require(t, err)
+	_, err = EnsureTxSucceeded(ctx, l1Backend, tx)
+	Require(t, err)
+
+	conf.Celestia = celestia.DAConfig{
+		Enable:      true,
+		GasPrice:    0.1,
+		Rpc:         "http://localhost:26658",
+		NamespaceId: "000008e5f679bf7116cb",
+		AuthToken:   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdfQ.8iCpZJaiui7QPTCj4m5f2M7JyHkJtr6Xha0bmE5Vv7Y",
+		ValidatorConfig: &celestia.ValidatorConfig{
+			TendermintRPC:  "http://localhost:26657",
+			BlobstreamAddr: blobstream.Hex(),
+		},
+	}
+
+	t.Log("Blobstream Address: ", blobstream.Hex())
+
+	celestiaDa, err := celestia.NewCelestiaDA(&conf.Celestia, l1Backend)
+	Require(t, err)
+	// Initialize Mockstream before the tests
+	header, err := celestiaDa.Client.Header.NetworkHead(ctx)
+	Require(t, err)
+	mockStreamWrapper.Initialize(&deployerTxOpts, header.Height())
 
 	var valStack *node.Node
 	var mockSpawn *mockSpawner
@@ -273,7 +227,6 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 	fatalErrChan := make(chan error, 10)
 	asserterRollupAddresses, initMessage := DeployOnTestL1(t, ctx, l1Info, l1Backend, chainConfig)
 
-	deployerTxOpts := l1Info.GetDefaultTransactOpts("deployer", ctx)
 	sequencerTxOpts := l1Info.GetDefaultTransactOpts("sequencer", ctx)
 	asserterTxOpts := l1Info.GetDefaultTransactOpts("asserter", ctx)
 	challengerTxOpts := l1Info.GetDefaultTransactOpts("challenger", ctx)
@@ -311,16 +264,16 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 	}
 
 	// seqNum := common.Big2
-	makeBatch(t, asserterL2, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
-	makeBatch(t, challengerL2, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-1)
+	makeCelestiaBatch(t, asserterL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
+	makeCelestiaBatch(t, challengerL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-1)
 
 	// seqNum.Add(seqNum, common.Big1)
-	makeBatch(t, asserterL2, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
-	makeBatch(t, challengerL2, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-makeBatch_MsgsPerBatch-1)
+	makeCelestiaBatch(t, asserterL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
+	makeCelestiaBatch(t, challengerL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-makeBatch_MsgsPerBatch-1)
 
 	// seqNum.Add(seqNum, common.Big1)
-	makeBatch(t, asserterL2, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
-	makeBatch(t, challengerL2, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-makeBatch_MsgsPerBatch*2-1)
+	makeCelestiaBatch(t, asserterL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, asserterL2Info, l1Backend, &sequencerTxOpts, asserterSeqInbox, asserterSeqInboxAddr, -1)
+	makeCelestiaBatch(t, challengerL2, celestiaDa, undecided, counterFactual, mockStreamWrapper, &deployerTxOpts, challengerL2Info, l1Backend, &sequencerTxOpts, challengerSeqInbox, challengerSeqInboxAddr, challengeMsgIdx-makeBatch_MsgsPerBatch*2-1)
 
 	trueSeqInboxAddr := challengerSeqInboxAddr
 	trueDelayedBridge := challengerBridgeAddr
@@ -330,7 +283,7 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 		trueDelayedBridge = asserterBridgeAddr
 		expectedWinner = l1Info.GetAddress("asserter")
 	}
-	ospEntry := DeployOneStepProofEntry(t, ctx, &deployerTxOpts, l1Backend)
+	ospEntry := DeployOneStepProofEntryCelestia(t, ctx, &deployerTxOpts, l1Backend)
 
 	locator, err := server_common.NewMachineLocator("")
 	if err != nil {
@@ -387,7 +340,10 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 
 	confirmLatestBlock(ctx, t, l1Info, l1Backend)
 
-	asserterValidator, err := staker.NewStatelessBlockValidator(asserterL2.InboxReader, asserterL2.InboxTracker, asserterL2.TxStreamer, asserterExec.Recorder, asserterL2ArbDb, nil, nil, nil, StaticFetcherFrom(t, &conf.BlockValidator), valStack)
+	// Add the L1 backend to Celestia DA
+	celestiaDa.Prover.EthClient = l1Backend
+
+	asserterValidator, err := staker.NewStatelessBlockValidator(asserterL2.InboxReader, asserterL2.InboxTracker, asserterL2.TxStreamer, asserterExec.Recorder, asserterL2ArbDb, nil, nil, celestiaDa, StaticFetcherFrom(t, &conf.BlockValidator), valStack)
 	if err != nil {
 		Fatal(t, err)
 	}
@@ -404,7 +360,7 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 	if err != nil {
 		Fatal(t, err)
 	}
-	challengerValidator, err := staker.NewStatelessBlockValidator(challengerL2.InboxReader, challengerL2.InboxTracker, challengerL2.TxStreamer, challengerExec.Recorder, challengerL2ArbDb, nil, nil, nil, StaticFetcherFrom(t, &conf.BlockValidator), valStack)
+	challengerValidator, err := staker.NewStatelessBlockValidator(challengerL2.InboxReader, challengerL2.InboxTracker, challengerL2.TxStreamer, challengerExec.Recorder, challengerL2ArbDb, nil, nil, celestiaDa, StaticFetcherFrom(t, &conf.BlockValidator), valStack)
 	if err != nil {
 		Fatal(t, err)
 	}
@@ -445,8 +401,12 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 		if err != nil {
 			if !currentCorrect && (strings.Contains(err.Error(), "lost challenge") ||
 				strings.Contains(err.Error(), "SAME_OSP_END") ||
-				strings.Contains(err.Error(), "BAD_SEQINBOX_MESSAGE")) {
+				strings.Contains(err.Error(), "BAD_SEQINBOX_MESSAGE")) ||
+				strings.Contains(err.Error(), "BLOBSTREAM_UNDECIDED") {
 				t.Log("challenge completed! asserter hit expected error:", err)
+				return
+			} else if (currentCorrect && counterFactual) && strings.Contains(err.Error(), "BAD_SEQINBOX_MESSAGE") {
+				t.Log("counterfactual challenge challenge completed! asserter hit expected error:", err)
 				return
 			}
 			Fatal(t, "challenge step", i, "hit error:", err)
@@ -493,16 +453,32 @@ func RunChallengeTest(t *testing.T, asserterIsCorrect bool, useStubs bool, chall
 	Fatal(t, "challenge timed out without winner")
 }
 
-func TestMockChallengeManagerAsserterIncorrect(t *testing.T) {
+func TestCelestiaChallengeManagerFullAsserterIncorrect(t *testing.T) {
 	t.Parallel()
-	for i := int64(1); i <= makeBatch_MsgsPerBatch*3; i++ {
-		RunChallengeTest(t, false, true, i)
-	}
+	RunCelestiaChallengeTest(t, false, false, makeBatch_MsgsPerBatch+1, false, false)
 }
 
-func TestMockChallengeManagerAsserterCorrect(t *testing.T) {
+func TestCelestiaChallengeManagerFullAsserterCorrect(t *testing.T) {
 	t.Parallel()
-	for i := int64(1); i <= makeBatch_MsgsPerBatch*3; i++ {
-		RunChallengeTest(t, true, true, i)
-	}
+	RunCelestiaChallengeTest(t, true, false, makeBatch_MsgsPerBatch+2, false, false)
+}
+
+func TestCelestiaChallengeManagerFullAsserterIncorrectUndecided(t *testing.T) {
+	t.Parallel()
+	RunCelestiaChallengeTest(t, false, false, makeBatch_MsgsPerBatch+1, true, false)
+}
+
+func TestCelestiaChallengeManagerFullAsserterCorrectUndecided(t *testing.T) {
+	t.Parallel()
+	RunCelestiaChallengeTest(t, true, false, makeBatch_MsgsPerBatch+2, true, false)
+}
+
+func TestCelestiaChallengeManagerFullAsserterIncorrectCounterfactual(t *testing.T) {
+	t.Parallel()
+	RunCelestiaChallengeTest(t, false, false, makeBatch_MsgsPerBatch+1, false, true)
+}
+
+func TestCelestiaChallengeManagerFullAsserterCorrectCounterfactual(t *testing.T) {
+	t.Parallel()
+	RunCelestiaChallengeTest(t, true, false, makeBatch_MsgsPerBatch+2, false, true)
 }

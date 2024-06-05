@@ -2154,7 +2154,6 @@ impl Machine {
         );
 
         // End next instruction proof, begin instruction specific serialization
-
         if let Some(next_inst) = func.code.get(self.pc.inst()) {
             if matches!(
                 next_inst.opcode,
@@ -2336,6 +2335,13 @@ impl Machine {
                         {
                             data.push(0); // inbox proof type
                             data.extend(msg_data);
+                            match inbox_identifier {
+                                InboxIdentifier::Sequencer => {
+                                    data.extend(msg_idx.to_be_bytes());
+                                    data.push(0x0);
+                                }
+                                InboxIdentifier::Delayed => data.push(0x1),
+                            }
                         }
                     } else {
                         panic!("Should never ever get here");
